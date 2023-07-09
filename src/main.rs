@@ -1,19 +1,82 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use eframe::egui;
-use egui::{Color32, FontId, RichText};
+use egui::{Color32, FontId, RichText, Window};
 use egui_extras::{Column, TableBuilder};
+use std::fmt::format;
+use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::thread::JoinHandle;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::runtime::Runtime;
+use tokio::sync::{mpsc::UnboundedSender, watch::Receiver};
+pub type Message = Box<[u8]>;
 
-fn main() -> Result<(), eframe::Error> {
+struct Network {
+    /// Handle to the network thread.
+    handle: JoinHandle<()>,
+    /// Unbounded sender (of messages) to the network thread.
+    submit: UnboundedSender<Message>,
+}
+
+fn main() -> std::io::Result<()> {
+    let ip = "0.0.0.0".parse::<Ipv4Addr>().unwrap();
+    let port = "15151".parse::<u16>().unwrap();
+    let addr = "0.0.0.0:11311".parse::<SocketAddr>().unwrap();
+    let std_sock = std::net::UdpSocket::bind(addr)?;
+    std_sock.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .thread_name("network")
+        .enable_io()
+        .build()?;
+    let udp = {
+        let _guard = runtime.enter();
+        tokio::net::UdpSocket::from_std(std_sock)?
+    };
+    use tokio::sync::{mpsc, watch};
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Message>();
+    let (log_tx, log_rx) = watch::channel(String::new());
+    let handle = std::thread::spawn(move || {
+        runtime.block_on(async move {
+               let mut buf = [0; 64];
+               loop {
+                   tokio::select! {
+                       biased;
+                       input_res = msg_rx.recv() => {
+                           let Some(input) = input_res else {
+                               break;
+                           };
+                           udp.send_to(&input, (ip, port)).await.expect("cannot send message to socket");
+                       }
+                       recv_res = udp.recv_from(&mut buf) => {
+                           let (count, remote_addr) = recv_res.expect("cannot receive from socket");
+                           if let Ok(parsed) = core::str::from_utf8(&buf[..count]) {
+                               log_tx.send_modify(|log| {
+                                   use core::fmt::Write;
+                                   log.write_fmt(format_args!("[{remote_addr}]: {parsed}\n")).expect("cannot append message to buffer");
+                               });
+                           }
+                       }
+                   }
+               }
+           })
+    });
+
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
     let options = eframe::NativeOptions {
         initial_window_size: Some(egui::vec2(320.0, 240.0)),
         ..Default::default()
     };
-    eframe::run_native("mymachi", options, Box::new(|_cc| Box::<MyApp>::default()))
+    let _ = eframe::run_native(
+        "mymachi",
+        options,
+        Box::new(|_cc| Box::new(MyApp::new(handle, msg_tx, log_rx))),
+    );
+    Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 struct Server {
     port: u16,
     running: bool,
@@ -26,16 +89,28 @@ struct MyApp {
     input_name: String,
     added_servers: Vec<Server>,
     input_port_correct: bool,
+    started: bool,
+    network: Option<Network>,
+    log: Receiver<String>,
+    show_server_response_window: bool,
 }
 
-impl Default for MyApp {
-    fn default() -> Self {
+impl MyApp {
+    pub fn new(
+        handle: JoinHandle<()>,
+        submit: UnboundedSender<Message>,
+        log: Receiver<String>,
+    ) -> Self {
         Self {
             service_ip: "0.0.0.0".to_owned(),
             input_port: "25565".to_owned(),
             input_name: "Minecraft".to_owned(),
             added_servers: Vec::new(),
             input_port_correct: true,
+            started: false,
+            network: Some(Network { handle, submit }),
+            show_server_response_window: false,
+            log,
         }
     }
 }
@@ -47,6 +122,10 @@ impl eframe::App for MyApp {
                 let service_ip_label = ui.label("service IP: ");
                 ui.text_edit_singleline(&mut self.service_ip)
                     .labelled_by(service_ip_label.id);
+                ui.checkbox(
+                    &mut self.show_server_response_window,
+                    "Server response window",
+                );
             });
             ui.vertical(|ui| {
                 ui.heading("Добавить сервер");
@@ -84,7 +163,7 @@ impl eframe::App for MyApp {
                     {
                         self.added_servers.push(Server {
                             port: self.input_port.parse::<u16>().unwrap(),
-                            running: true,
+                            running: false,
                             name: self.input_name.clone(),
                         });
                     }
@@ -131,7 +210,29 @@ impl eframe::App for MyApp {
                                 };
                                 if index < self.added_servers.len() {
                                     row.col(|ui| {
-                                        ui.checkbox(&mut self.added_servers[index].running, status);
+                                        if ui
+                                            .checkbox(
+                                                &mut self.added_servers[index].running,
+                                                status,
+                                            )
+                                            .changed()
+                                        {
+                                            self.network
+                                                .as_ref()
+                                                .unwrap()
+                                                .submit
+                                                .send(
+                                                    format!(
+                                                        "{} is {}",
+                                                        self.added_servers[index].name,
+                                                        self.added_servers[index].running
+                                                    )
+                                                    .to_string()
+                                                    .into_bytes()
+                                                    .into_boxed_slice(),
+                                                )
+                                                .expect("receiver closed");
+                                        }
                                     });
                                     row.col(|ui| {
                                         if ui.button("Удалить").clicked() {
@@ -178,35 +279,15 @@ impl eframe::App for MyApp {
                         );
                     }
                 }
-
-                // for (index, added_server) in self.added_servers.clone().iter_mut().enumerate() {
-                //     ui.horizontal(|ui| {
-                //         ui.label(
-                //             RichText::new(format!(
-                //                 "{}\t{}:{}",
-                //                 index + 1,
-                //                 added_server.name,
-                //                 added_server.port
-                //             ))
-                //             .color(if added_server.running {
-                //                 Color32::from_rgb(100, 255, 100)
-                //             } else {
-                //                 Color32::from_rgb(200, 200, 200)
-                //             }),
-                //         );
-                //         let status = if added_server.running {
-                //             "Включен"
-                //         } else {
-                //             "Выключен"f
-                //         };
-                //         if index < self.added_servers.len() {
-                //             let c = ui.checkbox(&mut self.added_servers[index].running, status);
-                //             if ui.button("Удалить").clicked() {
-                //                 self.added_servers.remove(index);
-                //             }
-                //         }
-                //     });
-                // }
+                Window::new("Server response")
+                    .open(&mut self.show_server_response_window)
+                    .vscroll(true)
+                    .show(ctx, |ui| {
+                        ui.set_min_height(300.0);
+                        ui.set_min_width(300.0);
+                        ui.label(RichText::new("Server response:").size(15.0));
+                        ui.label(self.log.borrow().to_string());
+                    });
             });
         });
     }
