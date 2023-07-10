@@ -3,13 +3,9 @@
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Window};
 use egui_extras::{Column, TableBuilder};
-use std::fmt::format;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread::JoinHandle;
-use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::runtime::Runtime;
 use tokio::sync::{mpsc::UnboundedSender, watch::Receiver};
 pub type Message = Box<[u8]>;
 
@@ -89,7 +85,6 @@ struct MyApp {
     input_name: String,
     added_servers: Vec<Server>,
     input_port_correct: bool,
-    started: bool,
     network: Option<Network>,
     log: Receiver<String>,
     show_server_response_window: bool,
@@ -107,7 +102,6 @@ impl MyApp {
             input_name: "Minecraft".to_owned(),
             added_servers: Vec::new(),
             input_port_correct: true,
-            started: false,
             network: Some(Network { handle, submit }),
             show_server_response_window: false,
             log,
