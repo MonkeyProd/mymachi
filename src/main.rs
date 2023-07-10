@@ -7,13 +7,31 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc::UnboundedSender, watch::Receiver};
-pub type Message = Box<[u8]>;
 
 struct Network {
     /// Handle to the network thread.
     handle: JoinHandle<()>,
     /// Unbounded sender (of messages) to the network thread.
     submit: UnboundedSender<Message>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Server {
+    port: u16,
+    running: bool,
+    name: String,
+}
+
+struct Address {
+    ip: Ipv4Addr,
+    port: u16,
+}
+
+pub type Message = SendType;
+
+pub enum SendType {
+    SendServiceServer(String),
+    AddClientServer(Server),
 }
 
 fn main() -> std::io::Result<()> {
@@ -36,6 +54,7 @@ fn main() -> std::io::Result<()> {
     let handle = std::thread::spawn(move || {
         runtime.block_on(async move {
                let mut buf = [0; 64];
+               let mut clientServers: Vec<Server> = Vec::new();
                loop {
                    tokio::select! {
                        biased;
@@ -43,7 +62,13 @@ fn main() -> std::io::Result<()> {
                            let Some(input) = input_res else {
                                break;
                            };
-                           udp.send_to(&input, (ip, port)).await.expect("cannot send message to socket");
+                           match input {
+                               SendType::SendServiceServer(mes) => { udp.send_to(&mes.into_bytes().into_boxed_slice(), (ip, port)).await.expect("cannot send message to socket");},
+                               SendType::AddClientServer(server) => {
+                                clientServers.push(server);
+                               },
+                           };
+
                        }
                        recv_res = udp.recv_from(&mut buf) => {
                            let (count, remote_addr) = recv_res.expect("cannot receive from socket");
@@ -51,6 +76,7 @@ fn main() -> std::io::Result<()> {
                                log_tx.send_modify(|log| {
                                    use core::fmt::Write;
                                    log.write_fmt(format_args!("[{remote_addr}]: {parsed}\n")).expect("cannot append message to buffer");
+                                   log.write_fmt(format_args!("Current servers: {:?}\n", clientServers)).expect("cannot append message to buffer");
                                });
                            }
                        }
@@ -70,13 +96,6 @@ fn main() -> std::io::Result<()> {
         Box::new(|_cc| Box::new(MyApp::new(handle, msg_tx, log_rx))),
     );
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct Server {
-    port: u16,
-    running: bool,
-    name: String,
 }
 
 struct MyApp {
@@ -160,6 +179,14 @@ impl eframe::App for MyApp {
                             running: false,
                             name: self.input_name.clone(),
                         });
+                        self.network
+                            .as_ref()
+                            .unwrap()
+                            .submit
+                            .send(SendType::AddClientServer(
+                                self.added_servers.last().unwrap().clone(),
+                            ))
+                            .expect("receiver closed");
                     }
                 });
                 let total_server_count = self.added_servers.len();
@@ -215,16 +242,14 @@ impl eframe::App for MyApp {
                                                 .as_ref()
                                                 .unwrap()
                                                 .submit
-                                                .send(
+                                                .send(SendType::SendServiceServer(
                                                     format!(
                                                         "{} is {}",
                                                         self.added_servers[index].name,
                                                         self.added_servers[index].running
                                                     )
-                                                    .to_string()
-                                                    .into_bytes()
-                                                    .into_boxed_slice(),
-                                                )
+                                                    .to_string(),
+                                                ))
                                                 .expect("receiver closed");
                                         }
                                     });
